@@ -1,0 +1,97 @@
+name: runner-probe
+
+# 驗三件事：
+#   A. 公開 repo 的「4 vCPU」是 4 個超執行緒還是 4 個實體核（看 Thread(s) per core + cgroup 配額）
+#   B. 實際平行加速曲線的膝點 = 真正可用的核心當量（跟 Modal 用同一支 bench.py）
+#   C. Free 方案的 20 併發 job 上限是不是真的
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_concurrency_probe:
+        description: "同時跑併發上限測試（25 個 job，約 3 分鐘）"
+        type: boolean
+        default: false
+
+jobs:
+  facts:
+    name: facts-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 執行器身分
+        run: |
+          echo "RUNNER_ARCH=$RUNNER_ARCH  RUNNER_OS=$RUNNER_OS  ImageOS=$ImageOS"
+          echo "RUNNER_NAME=$RUNNER_NAME"
+
+      - name: CPU 規格
+        run: |
+          echo "---- lscpu ----"
+          lscpu
+          echo "---- /proc/cpuinfo model ----"
+          grep -m1 "model name" /proc/cpuinfo || echo "(no model name)"
+          echo "---- nproc ----"
+          nproc
+
+      - name: cgroup 配額（決定性證據）
+        run: |
+          echo "---- cgroup v2 cpu.max ----"
+          cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo "(無)"
+          echo "---- cgroup v1 ----"
+          cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo "(無)"
+          cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo "(無)"
+          echo "---- 記憶體 ----"
+          head -3 /proc/meminfo
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "(無 v2 memory.max)"
+          echo "---- 磁碟 ----"
+          df -h / | tail -1
+
+      - name: 出網測試
+        run: |
+          for u in https://example.com https://api.github.com https://1.1.1.1 https://pypi.org/simple/; do
+            printf '%-30s -> ' "$u"
+            curl -sS -o /dev/null -m 12 -w '%{http_code}\n' "$u" || echo FAIL
+          done
+          printf '%-30s -> ' "任意埠 1.1.1.1:8080"
+          timeout 8 bash -c '</dev/tcp/1.1.1.1/8080' && echo OPEN || echo BLOCKED
+
+      - name: bench（與 Modal 同一支）
+        run: python3 bench.py --label "gh-${{ matrix.os }}" --out "out-${{ matrix.os }}.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: facts-${{ matrix.os }}
+          path: out-*.json
+
+  # 25 個 job 各記錄起訖時間戳並 sleep 150 秒。
+  # 把所有時間戳疊起來算最大重疊 = 真實併發上限。
+  concurrency-probe:
+    if: ${{ inputs.run_concurrency_probe }}
+    name: conc-${{ matrix.n }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 25
+      matrix:
+        n: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+    steps:
+      - name: 記錄時間戳
+        run: |
+          S=$(date +%s.%N)
+          sleep 150
+          E=$(date +%s.%N)
+          printf '{"n":%s,"start":%s,"end":%s}\n' "${{ matrix.n }}" "$S" "$E" > "slot-${{ matrix.n }}.json"
+          cat "slot-${{ matrix.n }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slot-${{ matrix.n }}
+          path: slot-*.json
