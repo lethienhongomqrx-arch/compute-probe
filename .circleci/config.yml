@@ -1,0 +1,160 @@
+# 放到公開 GitHub repo 的 .circleci/config.yml
+#
+# 驗三件事：
+#   A. 開源方案的 400,000 credits 是不是真的（跑完看 CircleCI 的用量頁）
+#   B. 各 resource_class 實際拿到的 CPU（threads_per_core + cgroup 配額 + 加速曲線）
+#   C. Free 方案的硬限制：單 job 1 小時、no_output_timeout 10 分鐘、30x 併發
+#
+# 需要 repo 裡有 bench.py（跟這個檔案同一個 repo 的根目錄）
+
+version: 2.1
+
+# ---------------------------------------------------------------- 可重用步驟
+commands:
+  probe:
+    parameters:
+      label:
+        type: string
+    steps:
+      - checkout
+      - run:
+          name: 規格與吞吐
+          # no_output_timeout 預設只有 10 分鐘，bench 中途會持續印東西所以沒問題，
+          # 但這裡還是明確設定，順便驗證這個參數是否可用
+          no_output_timeout: 30m
+          command: |
+            echo "---- resource class: << parameters.label >> ----"
+            echo "---- lscpu ----"
+            lscpu || true
+            echo "---- cgroup CPU 配額 ----"
+            cat /sys/fs/cgroup/cpu.max 2>/dev/null \
+              || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null \
+              || echo "(讀不到)"
+            echo "---- 記憶體 ----"
+            head -3 /proc/meminfo
+            cat /sys/fs/cgroup/memory.max 2>/dev/null \
+              || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true
+            echo "---- 出網測試 ----"
+            for u in https://example.com https://api.github.com https://1.1.1.1; do
+              printf '%-28s -> ' "$u"
+              curl -sS -o /dev/null -m 12 -w '%{http_code}\n' "$u" || echo FAIL
+            done
+            echo "---- bench ----"
+            python3 bench.py --label "<< parameters.label >>" --out "out-<< parameters.label >>.json"
+      - store_artifacts:
+          path: .
+          destination: results
+
+jobs:
+  # ---- B：四種 resource_class 的實際規格對照 ----
+  probe-small:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: small          # 官方：1 vCPU / 2 GB，5 credits/分
+    steps:
+      - probe:
+          label: cci-small
+
+  probe-medium:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: medium         # 官方：2 vCPU / 4 GB，10 credits/分
+    steps:
+      - probe:
+          label: cci-medium
+
+  probe-medium-plus:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: medium+        # 官方：3 vCPU / 6 GB
+    steps:
+      - probe:
+          label: cci-medium-plus
+
+  probe-large:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: large          # 官方：4 vCPU / 8 GB
+    steps:
+      - probe:
+          label: cci-large
+
+  # ---- C1：Free 方案是不是真的能用到 xlarge（官方說 Free 只到 large）----
+  probe-xlarge:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: xlarge         # 官方：8 vCPU / 16 GB —— 預期會失敗
+    steps:
+      - probe:
+          label: cci-xlarge
+
+  # ---- C2：單 job 時間上限（Free 方案官方說 1 小時）----
+  probe-duration:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: medium
+    steps:
+      - run:
+          name: 跑 75 分鐘，看 1 小時會不會被砍
+          no_output_timeout: 90m
+          command: |
+            START=$(date +%s)
+            for i in $(seq 1 90); do
+              echo "minute $i  elapsed=$(( $(date +%s) - START ))s"
+              sleep 60
+            done
+            echo "撐過 90 分鐘，沒有 1 小時上限"
+
+  # ---- C3：no_output_timeout 預設值（官方說 10 分鐘）----
+  probe-silence:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: small
+    steps:
+      - run:
+          name: 安靜 12 分鐘，不設 no_output_timeout
+          command: |
+            echo "開始安靜"
+            sleep 720
+            echo "撐過 12 分鐘，預設不是 10 分鐘"
+
+  # ---- C4：併發上限（Free 方案官方說 30x）----
+  conc:
+    parameters:
+      n:
+        type: integer
+    docker:
+      - image: cimg/python:3.12
+    resource_class: small
+    steps:
+      - run:
+          name: 記錄起訖時間戳
+          command: |
+            echo "slot << parameters.n >> start $(date +%s.%N)"
+            sleep 180
+            echo "slot << parameters.n >> end   $(date +%s.%N)"
+
+workflows:
+  # 預設只跑規格對照（便宜、快）
+  specs:
+    jobs:
+      - probe-small
+      - probe-medium
+      - probe-medium-plus
+      - probe-large
+      - probe-xlarge      # 預期在 Free 方案會被拒，這本身就是資料
+
+  # 限制測試：要跑的話把下面這行的註解拿掉
+  # limits:
+  #   jobs:
+  #     - probe-duration
+  #     - probe-silence
+
+  # 併發測試：丟 35 個 job，看同時最多跑幾個
+  # concurrency:
+  #   jobs:
+  #     - conc:
+  #         matrix:
+  #           parameters:
+  #             n: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+  #                 21,22,23,24,25,26,27,28,29,30,31,32,33,34,35]
